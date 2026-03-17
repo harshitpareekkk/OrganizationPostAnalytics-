@@ -10,6 +10,10 @@ app.use(express.json());
 app.use("/api", syncRoutes);
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  logger.info(`Server started successfully on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Server started on port ${PORT}`);
+  });
+}
+
+module.exports = app;
