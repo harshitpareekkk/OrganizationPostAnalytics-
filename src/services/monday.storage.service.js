@@ -47,11 +47,14 @@ const writeIndex = async (storage, ids, previousVersion) => {
 // Public API
 export const getStoredPost = async (token, postId) => {
   try {
+    logger.info(`[storage] GET post ${postId}: starting retrieval`);
     const storage = new Storage(token);
+
+    logger.info(`[storage] GET post ${postId}: executing storage.get()`);
     const res = await storage.get(postKey(postId), SHARED);
 
     if (!res || !res.success || res.value === null || res.value === undefined) {
-      logger.info(`[storage] GET post ${postId}: not found`);
+      logger.info(`[storage] GET post ${postId}: ✗ not found in storage`);
       return {
         success: false,
         statusCode: StatusCodes.NOT_FOUND,
@@ -61,7 +64,7 @@ export const getStoredPost = async (token, postId) => {
 
     const post = fromStorage(res.value);
     if (!post) {
-      logger.warn(`[storage] GET post ${postId}: parse failed`);
+      logger.warn(`[storage] GET post ${postId}: ✗ JSON parse failed`);
       return {
         success: false,
         statusCode: StatusCodes.INTERNAL_SERVER_ERROR,
@@ -69,10 +72,33 @@ export const getStoredPost = async (token, postId) => {
       };
     }
 
-    logger.info(`[storage] GET post ${postId}: found`);
+    logger.info(
+      `[storage] GET post ${postId}: ✓ found and parsed successfully`,
+    );
     return { success: true, statusCode: StatusCodes.OK, data: post };
   } catch (err) {
-    logger.error(`[storage] GET post ${postId} failed: ${err.message}`);
+    logger.error(`[storage] GET post ${postId}: ✗ Operation failed`);
+    logger.error(`[storage] ├─ Error message: ${err.message}`);
+    logger.error(`[storage] ├─ Error code: ${err.code || "unknown"}`);
+    logger.error(`[storage] ├─ Error status: ${err.status || "unknown"}`);
+    logger.error(`[storage] └─ Stack: ${err.stack}`);
+
+    // Check if it's an authorization error
+    if (
+      err.message?.includes("401") ||
+      err.message?.includes("unauthorized") ||
+      err.status === 401
+    ) {
+      logger.error(
+        `[storage] ✗ AUTHORIZATION ERROR: Token may be invalid or expired`,
+      );
+      return {
+        success: false,
+        statusCode: StatusCodes.UNAUTHORIZED,
+        error: "Storage authorization failed - token invalid or expired",
+      };
+    }
+
     return {
       success: false,
       statusCode: StatusCodes.INTERNAL_SERVER_ERROR,
@@ -84,32 +110,54 @@ export const getStoredPost = async (token, postId) => {
 export const savePostToStorage = async (token, postObj) => {
   const { postId } = postObj;
   try {
+    logger.info(`[storage] SAVE post ${postId}: starting storage save`);
     const storage = new Storage(token);
 
     // 1. Save the post as a JSON string
+    logger.info(
+      `[storage] SAVE post ${postId}: writing post object to storage`,
+    );
     const setRes = await storage.set(
       postKey(postId),
       toStorage(postObj),
       SHARED,
     );
     if (!setRes.success) {
-      logger.error(`[storage] SAVE post ${postId} failed: ${setRes.error}`);
+      logger.error(
+        `[storage] SAVE post ${postId}: ✗ storage.set failed with error: ${setRes.error}`,
+      );
       return {
         success: false,
         statusCode: StatusCodes.INTERNAL_SERVER_ERROR,
         error: MESSAGES.INTERNAL_SERVER_ERROR,
       };
     }
+    logger.info(`[storage] SAVE post ${postId}: ✓ post written to storage`);
 
     // 2. Update the index
+    logger.info(`[storage] SAVE post ${postId}: updating index`);
     const { ids, version } = await readIndex(storage);
     if (!ids.includes(postId)) ids.push(postId);
     await writeIndex(storage, ids, version);
+    logger.info(`[storage] SAVE post ${postId}: ✓ index updated`);
 
-    logger.info(`[storage] SAVE post ${postId}: success`);
+    logger.info(`[storage] SAVE post ${postId}: ✓ SUCCESS`);
     return { success: true, statusCode: StatusCodes.CREATED };
   } catch (err) {
-    logger.error(`[storage] SAVE post ${postId} failed: ${err.message}`);
+    logger.error(`[storage] SAVE post ${postId}: ✗ Operation failed`);
+    logger.error(`[storage] ├─ Error message: ${err.message}`);
+    logger.error(`[storage] ├─ Error code: ${err.code || "unknown"}`);
+    logger.error(`[storage] └─ Stack: ${err.stack}`);
+
+    if (err.message?.includes("401") || err.status === 401) {
+      logger.error(`[storage] ✗ AUTHORIZATION ERROR: Token invalid or expired`);
+      return {
+        success: false,
+        statusCode: StatusCodes.UNAUTHORIZED,
+        error: "Storage authorization failed - token invalid or expired",
+      };
+    }
+
     return {
       success: false,
       statusCode: StatusCodes.INTERNAL_SERVER_ERROR,
@@ -123,20 +171,28 @@ export const savePostToStorage = async (token, postObj) => {
  */
 export const updatePostInStorage = async (token, postId, updatedPostObj) => {
   try {
+    logger.info(`[storage] UPDATE post ${postId}: starting update`);
     const storage = new Storage(token);
 
     // Get current version for optimistic locking
     let previousVersion = null;
     try {
+      logger.info(
+        `[storage] UPDATE post ${postId}: fetching current version for lock`,
+      );
       const cur = await storage.get(postKey(postId), SHARED);
       previousVersion = cur?.version || null;
     } catch {
+      logger.info(
+        `[storage] UPDATE post ${postId}: no current version (key may not exist)`,
+      );
       /* key not found, write fresh */
     }
 
     const opts = { ...SHARED };
     if (previousVersion) opts.previousVersion = previousVersion;
 
+    logger.info(`[storage] UPDATE post ${postId}: writing updated object`);
     const setRes = await storage.set(
       postKey(postId),
       toStorage(updatedPostObj),
@@ -150,10 +206,23 @@ export const updatePostInStorage = async (token, postId, updatedPostObj) => {
       await storage.set(postKey(postId), toStorage(updatedPostObj), SHARED);
     }
 
-    logger.info(`[storage] UPDATE post ${postId}: success`);
+    logger.info(`[storage] UPDATE post ${postId}: ✓ SUCCESS`);
     return { success: true, statusCode: StatusCodes.OK };
   } catch (err) {
-    logger.error(`[storage] UPDATE post ${postId} failed: ${err.message}`);
+    logger.error(`[storage] UPDATE post ${postId}: ✗ Operation failed`);
+    logger.error(`[storage] ├─ Error message: ${err.message}`);
+    logger.error(`[storage] ├─ Error code: ${err.code || "unknown"}`);
+    logger.error(`[storage] └─ Stack: ${err.stack}`);
+
+    if (err.message?.includes("401") || err.status === 401) {
+      logger.error(`[storage] ✗ AUTHORIZATION ERROR: Token invalid or expired`);
+      return {
+        success: false,
+        statusCode: StatusCodes.UNAUTHORIZED,
+        error: "Storage authorization failed - token invalid or expired",
+      };
+    }
+
     return {
       success: false,
       statusCode: StatusCodes.INTERNAL_SERVER_ERROR,

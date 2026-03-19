@@ -5,30 +5,82 @@ const monday = mondaySdk();
 
 // ─── GraphQL helper
 const gql = async (token, query, variables = {}) => {
-  monday.setToken(token);
-  const res = await monday.api(query, {
-    token,
-    variables,
-    apiVersion: "2023-10",
-  });
+  try {
+    logger.info(`[gql] Validating token...`);
+    if (!token || typeof token !== "string" || token.length === 0) {
+      logger.error(`[gql] Invalid token provided - empty or not a string`);
+      throw new Error("Invalid token: must be a non-empty string");
+    }
+    logger.info(`[gql] Token validation passed`);
 
-  if (res.errors?.length) {
-    const msg = res.errors.map((e) => e.message).join(" | ");
-    throw new Error(`Monday API error: ${msg}`);
+    logger.info(`[gql] Setting Monday token...`);
+    monday.setToken(token);
+    logger.info(`[gql] Token set successfully`);
+
+    logger.info(`[gql] Executing Monday API query with apiVersion: 2023-10`);
+    const res = await monday.api(query, {
+      token,
+      variables,
+      apiVersion: "2023-10",
+    });
+
+    logger.info(`[gql] API response received`);
+
+    if (res.errors?.length) {
+      const errorDetails = res.errors.map((e) => ({
+        message: e.message,
+        statusCode: e.statusCode,
+        errorCode: e.errorCode,
+      }));
+      logger.error(
+        `[gql] Monday API returned ${res.errors.length} error(s): ${JSON.stringify(errorDetails)}`,
+      );
+      const msg = res.errors.map((e) => e.message).join(" | ");
+      throw new Error(`Monday API error: ${msg}`);
+    }
+
+    logger.info(`[gql] Query executed successfully`);
+    return res.data;
+  } catch (err) {
+    logger.error(`[gql] GraphQL execution failed: ${err.message}`);
+    throw err;
   }
-
-  return res.data;
 };
 
 export const testMondayAccess = async (token, boardId) => {
   const query = `query { boards(ids: [${boardId}]) { id name } }`;
   try {
+    logger.info(
+      `[testMondayAccess] Starting board access test for boardId: ${boardId}`,
+    );
+
+    if (!token || typeof token !== "string") {
+      logger.error(`[testMondayAccess] Invalid token for board access test`);
+      throw new Error("Invalid token provided to testMondayAccess");
+    }
+    logger.info(`[testMondayAccess] Token validation passed`);
+
+    logger.info(
+      `[testMondayAccess] Executing GraphQL query to test board access`,
+    );
     const data = await gql(token, query);
+
     const board = data?.boards?.[0];
-    logger.info(`[board] Token valid, board access confirmed`);
+    if (!board) {
+      logger.error(
+        `[testMondayAccess] Board ${boardId} returned no data - may not exist or token lacks permissions`,
+      );
+      throw new Error(`Board ${boardId} not accessible with provided token`);
+    }
+
+    logger.info(
+      `[testMondayAccess] ✓ Board access confirmed | boardId: ${board.id} | boardName: ${board.name}`,
+    );
     return board;
   } catch (err) {
-    logger.error(`[board] Token/board access test failed: ${err.message}`);
+    logger.error(
+      `[testMondayAccess] ✗ Token/board access test FAILED: ${err.message}`,
+    );
     throw err;
   }
 };
@@ -98,26 +150,42 @@ export const fetchBoardColumns = async (token, boardId) => {
     }
   `;
 
-  const data = await gql(token, query);
-  const board = data?.boards?.[0];
-  if (!board) {
-    throw new Error(
-      `Board "${boardId}" not found. Check MONDAY_BOARD_ID and that the token has access to this board.`,
+  try {
+    logger.info(
+      `[fetchBoardColumns] Starting column fetch for boardId: ${boardId}`,
     );
+    const data = await gql(token, query);
+
+    const board = data?.boards?.[0];
+    if (!board) {
+      logger.error(
+        `[fetchBoardColumns] Board ${boardId} not found in response - token may lack permissions`,
+      );
+      throw new Error(
+        `Board "${boardId}" not found. Check MONDAY_BOARD_ID and that the token has access to this board.`,
+      );
+    }
+
+    const columns = board.columns || [];
+    const columnMap = {}; // { "column title lowercased" → columnId }
+
+    logger.info(
+      `[fetchBoardColumns] ✓ Board loaded: "${board.name}" with ${columns.length} columns`,
+    );
+
+    for (const col of columns) {
+      const key = col.title.toLowerCase().trim();
+      columnMap[key] = col.id;
+      logger.debug(
+        `[fetchBoardColumns] Column: ${col.title} (type: ${col.type}, id: ${col.id})`,
+      );
+    }
+
+    return { columns, columnMap };
+  } catch (err) {
+    logger.error(`[fetchBoardColumns] ✗ Column fetch failed: ${err.message}`);
+    throw err;
   }
-
-  const columns = board.columns || [];
-  const columnMap = {}; // { "column title lowercased" → columnId }
-
-  logger.info(
-    `[board] Board loaded: "${board.name}" with ${columns.length} columns`,
-  );
-  for (const col of columns) {
-    const key = col.title.toLowerCase().trim();
-    columnMap[key] = col.id;
-  }
-
-  return { columns, columnMap };
 };
 
 // Build column_values
@@ -272,34 +340,52 @@ export const createBoardItem = async (
   columns,
   boardId,
 ) => {
-  const itemName = String(
-    postObj.details?.postId || postObj.postId || "unknown",
-  );
-  const columnValuesStr = buildColumnValues(postObj, columnMap, columns, false);
+  try {
+    const itemName = String(
+      postObj.details?.postId || postObj.postId || "unknown",
+    );
+    const columnValuesStr = buildColumnValues(
+      postObj,
+      columnMap,
+      columns,
+      false,
+    );
 
-  logger.info(`[board] Creating board item: ${itemName}`);
+    logger.info(`[createBoardItem] Starting creation for: ${itemName}`);
+    logger.info(`[createBoardItem] Board ID: ${boardId}`);
+    logger.info(`[createBoardItem] Column values: ${columnValuesStr}`);
 
-  const query = `
-    mutation ($boardId: ID!, $itemName: String!, $columnValues: JSON!) {
-      create_item(
-        board_id:      $boardId
-        item_name:     $itemName
-        column_values: $columnValues
-      ) { id name }
+    const query = `
+      mutation ($boardId: ID!, $itemName: String!, $columnValues: JSON!) {
+        create_item(
+          board_id:      $boardId
+          item_name:     $itemName
+          column_values: $columnValues
+        ) { id name }
+      }
+    `;
+
+    logger.info(`[createBoardItem] Executing create_item mutation`);
+    const data = await gql(token, query, {
+      boardId: String(boardId),
+      itemName,
+      columnValues: columnValuesStr,
+    });
+
+    const itemId = data?.create_item?.id;
+    if (!itemId) {
+      logger.error(
+        `[createBoardItem] Mutation returned no item ID - check board permissions`,
+      );
+      throw new Error("create_item returned no id — check board permissions");
     }
-  `;
 
-  const data = await gql(token, query, {
-    boardId: String(boardId),
-    itemName,
-    columnValues: columnValuesStr,
-  });
-  const itemId = data?.create_item?.id;
-  if (!itemId)
-    throw new Error("create_item returned no id — check board permissions");
-
-  logger.info(`[board] Board item created: ${itemId}`);
-  return String(itemId);
+    logger.info(`[createBoardItem] ✓ Board item created: ${itemId}`);
+    return String(itemId);
+  } catch (err) {
+    logger.error(`[createBoardItem] ✗ Item creation failed: ${err.message}`);
+    throw err;
+  }
 };
 
 // ─── Update board item (analytics only)
@@ -311,33 +397,49 @@ export const updateBoardItem = async (
   columns,
   boardId,
 ) => {
-  const columnValuesStr = buildColumnValues(
-    { analytics, details: {} },
-    columnMap,
-    columns,
-    true, // analyticsOnly = true
-  );
+  try {
+    const columnValuesStr = buildColumnValues(
+      { analytics, details: {} },
+      columnMap,
+      columns,
+      true, // analyticsOnly = true
+    );
 
-  logger.info(`[board] Updating board item analytics: ${itemId}`);
+    logger.info(`[updateBoardItem] Starting update for itemId: ${itemId}`);
+    logger.info(`[updateBoardItem] Board ID: ${boardId}`);
+    logger.info(`[updateBoardItem] Column values: ${columnValuesStr}`);
 
-  const query = `
-    mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
-      change_multiple_column_values(
-        board_id:      $boardId
-        item_id:       $itemId
-        column_values: $columnValues
-      ) { id name }
+    const query = `
+      mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+        change_multiple_column_values(
+          board_id:      $boardId
+          item_id:       $itemId
+          column_values: $columnValues
+        ) { id name }
+      }
+    `;
+
+    logger.info(
+      `[updateBoardItem] Executing change_multiple_column_values mutation`,
+    );
+    const data = await gql(token, query, {
+      boardId: String(boardId),
+      itemId: String(itemId),
+      columnValues: columnValuesStr,
+    });
+
+    const updatedId = data?.change_multiple_column_values?.id;
+    if (!updatedId) {
+      logger.error(`[updateBoardItem] Mutation returned no item ID`);
+      throw new Error("change_multiple_column_values returned no id");
     }
-  `;
 
-  const data = await gql(token, query, {
-    boardId: String(boardId),
-    itemId: String(itemId),
-    columnValues: columnValuesStr,
-  });
-
-  logger.info(`[board] Board item updated: ${itemId}`);
-  return data?.change_multiple_column_values?.id;
+    logger.info(`[updateBoardItem] ✓ Board item updated: ${itemId}`);
+    return updatedId;
+  } catch (err) {
+    logger.error(`[updateBoardItem] ✗ Item update failed: ${err.message}`);
+    throw err;
+  }
 };
 
 // ─── Find board item by postId
@@ -353,21 +455,33 @@ export const findBoardItemByPostId = async (token, postId, boardId) => {
   `;
 
   try {
+    logger.info(
+      `[findBoardItemByPostId] Searching for post ${postId} in boardId ${boardId}`,
+    );
     const data = await gql(token, query);
+
     const items = data?.boards?.[0]?.items_page?.items || [];
+    logger.info(`[findBoardItemByPostId] Found ${items.length} items on board`);
+
     const match = items.find(
       (item) =>
         item.name === String(postId) || item.name?.includes(String(postId)),
     );
 
     if (match) {
-      logger.info(`[board] Found board item for post ${postId}`);
+      logger.info(
+        `[findBoardItemByPostId] ✓ Found board item for post ${postId}: ${match.id}`,
+      );
       return String(match.id);
     }
-    logger.info(`[board] No board item found for post ${postId}`);
+    logger.info(
+      `[findBoardItemByPostId] No board item found for post ${postId}`,
+    );
     return null;
   } catch (err) {
-    logger.error(`[board] Error searching for board item: ${err.message}`);
+    logger.error(
+      `[findBoardItemByPostId] ✗ Error searching for board item: ${err.message}`,
+    );
     return null;
   }
 };
