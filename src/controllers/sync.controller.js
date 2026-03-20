@@ -22,7 +22,7 @@ import { logger } from "../utils/logger.js";
 import { StatusCodes } from "../constants/statusCodes.constants.js";
 import { MESSAGES } from "../constants/messages.constant.js";
 
-// ─── Helper: Generate signed JWT token for Monday callback ───
+// ─── Helper: Generate signed JWT token for Monday callback ───────────────────
 const getAuthToken = () => {
   const signingSecret = process.env.MONDAY_SIGNING_SECRET;
   const appId = Number(process.env.MONDAY_APP_ID);
@@ -35,8 +35,34 @@ const getAuthToken = () => {
   return jwt.sign({ appId }, signingSecret);
 };
 
+// ─── Reusable callback sender ─────────────────────────────────────────────────
+const sendCallback = async (callbackUrl, success) => {
+  if (!callbackUrl) {
+    logger.warn(`[sync] No callback URL — skipping Monday callback`);
+    return;
+  }
+  try {
+    const authToken = getAuthToken();
+    await axios.post(
+      callbackUrl,
+      { success, outputFields: {} },
+      {
+        timeout: 10000,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authToken,
+        },
+      },
+    );
+    logger.info(`[sync] └─ Callback sent: ✓ (success=${success})`);
+  } catch (callbackErr) {
+    logger.warn(`[sync] └─ Callback error (non-fatal): ${callbackErr.message}`);
+  }
+};
+
 export const syncLinkedInPosts = async (req, res) => {
   let callbackUrl = null;
+
   try {
     logger.info(
       "═════════════════════════════════════════════════════════════",
@@ -48,484 +74,460 @@ export const syncLinkedInPosts = async (req, res) => {
       "[sync] ─────────────────────────────────────────────────────────",
     );
 
-    // Extract callbackUrl and token from Monday's payload (seamless authentication)
-    const payload = req.body?.payload;
-
-    logger.info(`[sync] Step 1: Validate payload`);
+    // ── SEAMLESS AUTH: Extract JWT from Authorization header ─────────────────
+    // Monday sends a JWT in the Authorization header containing shortLivedToken
+    // (valid for 5 minutes)
     logger.info(
-      `[sync] └─ Payload object: ${payload ? "✓ Received" : "✗ MISSING"}`,
+      `[sync] Step 1: Extract and decode JWT from Authorization header`,
+    );
+    const signingSecret = process.env.MONDAY_SIGNING_SECRET;
+    const authHeader = req.headers.authorization;
+
+    logger.info(
+      `[sync] ├─ Authorization header: ${authHeader ? "✓ Present" : "✗ MISSING"}`,
     );
 
-    if (!payload) {
-      logger.error("[sync] ✗ FATAL: No payload in request body");
+    if (!authHeader) {
+      logger.error(`[sync] ✗✗✗ AUTHORIZATION FAILED ✗✗✗`);
+      logger.error(`[sync] ├─ No Authorization header in request`);
       logger.error(
-        `[sync] Request body keys: ${Object.keys(req.body || {}).join(", ")}`,
+        `[sync] ├─ Headers present: ${Object.keys(req.headers || {}).join(", ")}`,
       );
-      return res.status(StatusCodes.BAD_REQUEST).json({
+      logger.error(
+        `[sync] └─ ACTION: Built-in triggers should send JWT in Authorization header`,
+      );
+
+      return res.status(StatusCodes.UNAUTHORIZED).json({
         success: false,
-        error: "Missing payload in request body",
+        error: "Missing Authorization header from Monday",
+        message:
+          "Monday should send a JWT in the Authorization header containing the shortLivedToken",
       });
     }
 
+    let decodedJwt;
+    try {
+      decodedJwt = jwt.verify(authHeader, signingSecret);
+      logger.info(`[sync] └─ JWT decoded successfully ✓`);
+    } catch (jwtErr) {
+      logger.error(`[sync] ✗ JWT verification failed: ${jwtErr.message}`);
+      return res.status(StatusCodes.UNAUTHORIZED).json({
+        success: false,
+        error: "Invalid JWT in Authorization header",
+        message: "JWT verification failed",
+      });
+    }
+
+    const shortLivedToken = decodedJwt.shortLivedToken;
+    const accountId = decodedJwt.accountId;
+
+    logger.info(`[sync] Step 2: Validate seamless authentication`);
+    logger.info(
+      `[sync] ├─ shortLivedToken: ${shortLivedToken ? "✓ Found" : "✗ MISSING"}`,
+    );
+    logger.info(`[sync] ├─ accountId: ${accountId ? "✓ Found" : "✗ MISSING"}`);
+
+    if (!shortLivedToken || !accountId) {
+      logger.error(`[sync] ✗✗✗ AUTHORIZATION FAILED ✗✗✗`);
+      logger.error(`[sync] ├─ Missing required fields from JWT payload`);
+      logger.error(
+        `[sync] ├─ JWT payload keys: ${Object.keys(decodedJwt || {}).join(", ")}`,
+      );
+      logger.error(
+        `[sync] └─ ACTION: Verify Monday trigger is sending valid JWT`,
+      );
+
+      return res.status(StatusCodes.UNAUTHORIZED).json({
+        success: false,
+        error: "Missing shortLivedToken or accountId from JWT",
+        message: "JWT payload must contain both shortLivedToken and accountId",
+      });
+    }
+
+    logger.info(`[sync] └─ Token length: ${shortLivedToken.length} chars`);
+
+    // Extract payload for callbackUrl and other data from request body
+    const payload = req.body?.payload;
     callbackUrl = payload?.callbackUrl;
     logger.info(
-      `[sync] └─ Callback URL: ${callbackUrl ? "✓ Present" : "✗ Missing"}`,
+      `[sync] ├─ Callback URL: ${callbackUrl ? "✓ Present" : "✗ Missing"}`,
     );
 
-    // IMPORTANT: Use shortLivedToken from payload for Monday API calls (seamless auth)
-    const shortLivedToken = payload?.shortLivedToken;
+    // ── Respond 200 immediately so Monday does not timeout ────────────────────
+    // Monday automation blocks expect a 200 ACK quickly.
+    // Then we do the actual work and call callbackUrl when done.
+    res.status(200).json({ success: true, message: "Sync acknowledged" });
+    logger.info("[sync] ✓ Sent immediate 200 ACK to Monday");
 
-    logger.info(`[sync] Step 2: Validate authentication token`);
-    logger.info(
-      `[sync] └─ shortLivedToken: ${shortLivedToken ? "✓ Found" : "✗ MISSING"}`,
-    );
-    logger.info(
-      `[sync] └─ Token length: ${shortLivedToken?.length || 0} chars`,
-    );
+    // ── All work below runs after the response is already sent ───────────────
+    (async () => {
+      try {
+        // Use the seamless token from Monday (valid for 5 minutes)
+        const mondayToken = shortLivedToken;
+        logger.info(`[sync] ├─ Using seamless token from Monday payload`);
+        logger.info(`[sync] └─ Account ID: ${accountId}`);
 
-    if (!shortLivedToken || typeof shortLivedToken !== "string") {
-      logger.error(
-        `[sync] ✗ AUTHORIZATION FAILED: No or invalid shortLivedToken in payload`,
-      );
-      logger.error(
-        `[sync] Payload keys received: ${Object.keys(payload).join(", ")}`,
-      );
-      return res.status(StatusCodes.UNAUTHORIZED).json({
-        success: false,
-        error:
-          "Missing shortLivedToken from Monday payload - authorization failed",
-      });
-    }
-    logger.info(`[sync] └─ Token validation: ✓ PASSED`);
-
-    // Extract accountId from payload
-    const accountId = payload?.accountId;
-    logger.info(`[sync] Step 3: Extract account metadata`);
-    logger.info(`[sync] └─ Account ID: ${accountId || "unknown"}`);
-
-    // Board ID
-    const boardId = String(
-      payload?.inputFields?.boardId || process.env.MONDAY_BOARD_ID || "",
-    );
-
-    if (!boardId) {
-      logger.error("[sync] ✗ CONFIGURATION ERROR: Missing boardId");
-      logger.error(
-        `[sync] inputFields.boardId: ${payload?.inputFields?.boardId}`,
-      );
-      logger.error(
-        `[sync] MONDAY_BOARD_ID env: ${process.env.MONDAY_BOARD_ID}`,
-      );
-      return res.status(StatusCodes.BAD_REQUEST).json({
-        success: false,
-        error: MESSAGES.BAD_REQUEST,
-      });
-    }
-
-    const boardSource = req.body?.payload?.inputFields?.boardId
-      ? "Monday automation inputFields"
-      : ".env MONDAY_BOARD_ID";
-    logger.info(`[sync] └─ Board ID: ${boardId} (from: ${boardSource})`);
-
-    logger.info(`[sync] Step 4: Test Monday board access`);
-    try {
-      await testMondayAccess(shortLivedToken, boardId);
-      logger.info(`[sync] └─ Board access test: ✓ PASSED`);
-    } catch (err) {
-      logger.error(`[sync] ✗ BOARD ACCESS FAILED: ${err.message}`);
-      logger.error(
-        `[sync] This indicates an authorization issue with the provided token`,
-      );
-      return res.status(StatusCodes.UNAUTHORIZED).json({
-        success: false,
-        error: `Cannot access board ${boardId}: ${err.message}`,
-      });
-    }
-
-    // Step 1: Fetch board columns
-    logger.info(`[sync] Step 5: Fetch board structure`);
-    let columns = [];
-    let columnMap = {};
-    try {
-      ({ columns, columnMap } = await fetchBoardColumns(
-        shortLivedToken,
-        boardId,
-      ));
-      logger.info(`[sync] └─ Columns fetched: ✓ ${columns.length} columns`);
-    } catch (err) {
-      logger.error(`[sync] ✗ COLUMN FETCH FAILED: ${err.message}`);
-      logger.error(
-        `[sync] This is typically an authorization issue - verify token has board access`,
-      );
-      return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
-        success: false,
-        error: `Board columns fetch failed: ${err.message}`,
-      });
-    }
-
-    // Step 2: Fetch LinkedIn posts
-    logger.info("[sync] Step 6: Fetch LinkedIn posts");
-    const posts = await fetchLastThreeMonthsPosts();
-    logger.info(
-      `[sync] └─ Posts fetched: ✓ ${posts.length} posts from 90 days`,
-    );
-
-    if (posts.length === 0) {
-      logger.info("[sync] └─ No posts to sync, completing");
-      return res.json({
-        success: true,
-        summary: { total: 0, created: 0, updated: 0, unchanged: 0, failed: 0 },
-        results: [],
-      });
-    }
-
-    const results = [];
-
-    // ── Step 3: Process each post — STRICTLY one at a time
-    logger.info(`[sync] Step 7: Process ${posts.length} posts sequentially`);
-    for (const post of posts) {
-      const postId = post.id;
-      logger.info(`[sync] ├─ Processing post: ${postId}`);
-
-      const details = extractPostDetails(post, post._resolvedAuthorName || "");
-
-      // Storage check FIRST — before analytics fetch — keeps loop strictly sequential
-      logger.info(`[sync] │  ├─ Check if post exists in storage`);
-      const postCheckResult = await getStoredPost(shortLivedToken, postId);
-
-      // Handle token validation error from service
-      if (
-        !postCheckResult.success &&
-        postCheckResult.statusCode === StatusCodes.UNAUTHORIZED
-      ) {
-        logger.error(
-          `[sync] │  ✗ TOKEN INVALID - Storage service returned 401`,
+        // Board ID
+        const boardId = String(
+          payload?.inputFields?.boardId || process.env.MONDAY_BOARD_ID || "",
         );
-        logger.error(`[sync] │  Details: ${postCheckResult.error}`);
-        return res.status(postCheckResult.statusCode).json({
-          success: false,
-          error: postCheckResult.error,
-        });
-      }
 
-      const existingPost = postCheckResult.success
-        ? postCheckResult.data
-        : null;
-
-      logger.info(
-        `[sync] │  └─ Storage check: ${existingPost ? "Exists" : "New post"}`,
-      );
-
-      // Fetch analytics once per post
-      const analytics = await fetchPostStats(postId);
-
-      if (!existingPost) {
-        logger.info(`[sync] │  └─ Action: CREATE new board item`);
-
-        const postObj = {
-          postId,
-          details,
-          analytics,
-          boardItemId: null,
-          boardId,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-
-        // (a) Save to Monday Storage
-        logger.info(`[sync] │     ├─ Saving to Monday Storage...`);
-        const saved = await savePostToStorage(shortLivedToken, postObj);
-        if (!saved.success) {
-          logger.error(`[sync] │     ✗ Storage save failed: ${saved.error}`);
-          results.push({
-            postId,
-            postedAt: details.createdAt,
-            status: "SAVE_FAILED",
-          });
-          continue;
+        if (!boardId) {
+          logger.error("[sync] ✗ CONFIGURATION ERROR: Missing boardId");
+          await sendCallback(callbackUrl, false);
+          return;
         }
-        logger.info(`[sync] │     └─ Saved to storage: ✓`);
 
-        // (b) Create board row  (item_name = postId)
-        logger.info(`[sync] │     ├─ Creating Monday board item...`);
-        let boardItemId = null;
+        const boardSource = payload?.inputFields?.boardId
+          ? "Monday automation inputFields"
+          : ".env MONDAY_BOARD_ID";
+        logger.info(`[sync] Step 3: Configure board access`);
+        logger.info(`[sync] └─ Board ID: ${boardId} (from: ${boardSource})`);
+
+        logger.info(`[sync] Step 4: Test Monday board access`);
         try {
-          boardItemId = await createBoardItem(
-            shortLivedToken,
-            postObj,
-            columnMap,
-            columns,
-            boardId,
-          );
-          logger.info(`[sync] │     └─ Board item created: ✓ ${boardItemId}`);
+          await testMondayAccess(mondayToken, boardId);
+          logger.info(`[sync] └─ Board access test: ✓ PASSED`);
         } catch (err) {
-          logger.error(`[sync] │     ✗ Board creation failed: ${err.message}`);
+          logger.error(`[sync] ✗ BOARD ACCESS FAILED: ${err.message}`);
+          await sendCallback(callbackUrl, false);
+          return;
         }
 
-        // (c) Save boardItemId to storage so next sync can update directly
-        if (boardItemId) {
-          logger.info(`[sync] │     ├─ Updating storage with boardItemId...`);
-          const updateRes = await updatePostInStorage(shortLivedToken, postId, {
-            ...postObj,
-            boardItemId,
-          });
-          if (updateRes.success) {
-            logger.info(`[sync] │     └─ Board item ID stored: ✓`);
-          } else {
-            logger.warn(
-              `[sync] │     ✗ Failed to store board item ID: ${updateRes.error}`,
-            );
-          }
+        logger.info(`[sync] Step 5: Fetch board structure`);
+        let columns = [];
+        let columnMap = {};
+        try {
+          ({ columns, columnMap } = await fetchBoardColumns(
+            mondayToken,
+            boardId,
+          ));
+          logger.info(`[sync] └─ Columns fetched: ✓ ${columns.length} columns`);
+        } catch (err) {
+          logger.error(`[sync] ✗ COLUMN FETCH FAILED: ${err.message}`);
+          await sendCallback(callbackUrl, false);
+          return;
         }
 
-        results.push({
-          postId,
-          postedAt: details.createdAt,
-          boardItemId: boardItemId || null,
-          status: boardItemId ? "CREATED" : "CREATED_STORAGE_ONLY",
-        });
-      } else {
-        const analyticsChanged = hasMetricsChanged(
-          existingPost.analytics,
-          analytics,
+        logger.info("[sync] Step 6: Fetch LinkedIn posts");
+        const posts = await fetchLastThreeMonthsPosts();
+        logger.info(
+          `[sync] └─ Posts fetched: ✓ ${posts.length} posts from 90 days`,
         );
 
-        if (analyticsChanged) {
-          logger.info(`[sync] │  └─ Action: UPDATE analytics`);
+        if (posts.length === 0) {
+          logger.info("[sync] └─ No posts to sync, completing");
+          await sendCallback(callbackUrl, true);
+          return;
+        }
 
-          const updatedPost = {
-            ...existingPost,
-            analytics,
-            updatedAt: new Date().toISOString(),
-          };
+        const results = [];
 
-          // Update storage
-          logger.info(`[sync] │     ├─ Updating storage...`);
-          const updateRes = await updatePostInStorage(
-            shortLivedToken,
-            postId,
-            updatedPost,
+        logger.info(
+          `[sync] Step 7: Process ${posts.length} posts sequentially`,
+        );
+        for (const post of posts) {
+          const postId = post.id;
+          logger.info(`[sync] ├─ Processing post: ${postId}`);
+
+          const details = extractPostDetails(
+            post,
+            post._resolvedAuthorName || "",
           );
-          if (updateRes.success) {
-            logger.info(`[sync] │     └─ Storage updated: ✓`);
-          } else {
+
+          // Storage check FIRST — before analytics fetch
+          logger.info(`[sync] │  ├─ Check if post exists in storage`);
+          const postCheckResult = await getStoredPost(mondayToken, postId);
+
+          // Handle token validation error from service
+          if (
+            !postCheckResult.success &&
+            postCheckResult.statusCode === StatusCodes.UNAUTHORIZED
+          ) {
             logger.error(
-              `[sync] │     ✗ Storage update failed: ${updateRes.error}`,
+              `[sync] │  ✗ TOKEN INVALID - Storage service returned 401`,
             );
+            logger.error(`[sync] │  Details: ${postCheckResult.error}`);
+            await sendCallback(callbackUrl, false);
+            return;
           }
 
-          // Find board item ID
-          let boardItemId = existingPost.boardItemId || null;
-          if (!boardItemId) {
-            logger.info(`[sync] │     ├─ Searching for board item...`);
-            boardItemId = await findBoardItemByPostId(
-              shortLivedToken,
+          const existingPost = postCheckResult.success
+            ? postCheckResult.data
+            : null;
+
+          logger.info(
+            `[sync] │  └─ Storage check: ${existingPost ? "Exists" : "New post"}`,
+          );
+
+          // Fetch analytics once per post
+          const analytics = await fetchPostStats(postId);
+
+          if (!existingPost) {
+            logger.info(`[sync] │  └─ Action: CREATE new board item`);
+
+            const postObj = {
               postId,
+              details,
+              analytics,
+              boardItemId: null,
               boardId,
-            );
-            if (boardItemId) {
-              logger.info(`[sync] │     └─ Found: ${boardItemId}`);
-              const updateRes = await updatePostInStorage(
-                shortLivedToken,
-                postId,
-                {
-                  ...updatedPost,
-                  boardItemId,
-                },
-              );
-              if (!updateRes.success) {
-                logger.warn(
-                  `[sync] │     ✗ Failed to store found board item ID`,
-                );
-              }
-            } else {
-              logger.info(`[sync] │     └─ Board item not found`);
-            }
-          }
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            };
 
-          if (boardItemId) {
-            try {
-              logger.info(`[sync] │     ├─ Updating board analytics...`);
-              await updateBoardItem(
-                shortLivedToken,
-                boardItemId,
-                analytics,
-                columnMap,
-                columns,
-                boardId,
-              );
-              logger.info(`[sync] │     └─ Board updated: ✓`);
-              results.push({
-                postId,
-                postedAt: details.createdAt,
-                boardItemId,
-                status: "UPDATED",
-              });
-            } catch (err) {
+            // (a) Save to Monday Storage
+            logger.info(`[sync] │     ├─ Saving to Monday Storage...`);
+            const saved = await savePostToStorage(mondayToken, postObj);
+            if (!saved.success) {
               logger.error(
-                `[sync] │     ✗ Board update failed: ${err.message}`,
+                `[sync] │     ✗ Storage save failed: ${saved.error}`,
               );
               results.push({
                 postId,
                 postedAt: details.createdAt,
-                boardItemId,
-                status: "UPDATE_FAILED",
+                status: "SAVE_FAILED",
               });
+              continue;
             }
-          } else {
-            // No board item found — create one now as recovery
-            logger.warn(
-              `[sync] │  ✗ No board item found for post ${postId}, attempting recovery`,
-            );
+            logger.info(`[sync] │     └─ Saved to storage: ✓`);
+
+            // (b) Create board row (item_name = postId)
+            logger.info(`[sync] │     ├─ Creating Monday board item...`);
+            let boardItemId = null;
             try {
               boardItemId = await createBoardItem(
-                shortLivedToken,
-                updatedPost,
+                mondayToken,
+                postObj,
                 columnMap,
                 columns,
                 boardId,
               );
-              const updateRes = await updatePostInStorage(
-                shortLivedToken,
-                postId,
-                {
-                  ...updatedPost,
-                  boardItemId,
-                },
+              logger.info(
+                `[sync] │     └─ Board item created: ✓ ${boardItemId}`,
               );
-              if (updateRes.success) {
-                logger.info(
-                  `[sync] │  └─ Board item created successfully (recovery)`,
-                );
-              } else {
-                logger.warn(
-                  `[sync] │  └─ Board item created but storage update failed`,
-                );
-              }
             } catch (err) {
               logger.error(
-                `[sync] │  ✗ Recovery creation failed: ${err.message}`,
+                `[sync] │     ✗ Board creation failed: ${err.message}`,
               );
             }
+
+            // (c) Save boardItemId to storage so next sync can update directly
+            if (boardItemId) {
+              logger.info(
+                `[sync] │     ├─ Updating storage with boardItemId...`,
+              );
+              const updateRes = await updatePostInStorage(mondayToken, postId, {
+                ...postObj,
+                boardItemId,
+              });
+              if (updateRes.success) {
+                logger.info(`[sync] │     └─ Board item ID stored: ✓`);
+              } else {
+                logger.warn(
+                  `[sync] │     ✗ Failed to store board item ID: ${updateRes.error}`,
+                );
+              }
+            }
+
+            results.push({
+              postId,
+              postedAt: details.createdAt,
+              boardItemId: boardItemId || null,
+              status: boardItemId ? "CREATED" : "CREATED_STORAGE_ONLY",
+            });
+          } else {
+            const analyticsChanged = hasMetricsChanged(
+              existingPost.analytics,
+              analytics,
+            );
+
+            if (analyticsChanged) {
+              logger.info(`[sync] │  └─ Action: UPDATE analytics`);
+
+              const updatedPost = {
+                ...existingPost,
+                analytics,
+                updatedAt: new Date().toISOString(),
+              };
+
+              // Update storage
+              logger.info(`[sync] │     ├─ Updating storage...`);
+              const updateRes = await updatePostInStorage(
+                mondayToken,
+                postId,
+                updatedPost,
+              );
+              if (updateRes.success) {
+                logger.info(`[sync] │     └─ Storage updated: ✓`);
+              } else {
+                logger.error(
+                  `[sync] │     ✗ Storage update failed: ${updateRes.error}`,
+                );
+              }
+
+              // Find board item ID
+              let boardItemId = existingPost.boardItemId || null;
+              if (!boardItemId) {
+                logger.info(`[sync] │     ├─ Searching for board item...`);
+                boardItemId = await findBoardItemByPostId(
+                  mondayToken,
+                  postId,
+                  boardId,
+                );
+                if (boardItemId) {
+                  logger.info(`[sync] │     └─ Found: ${boardItemId}`);
+                  const updateRes = await updatePostInStorage(
+                    mondayToken,
+                    postId,
+                    {
+                      ...updatedPost,
+                      boardItemId,
+                    },
+                  );
+                  if (!updateRes.success) {
+                    logger.warn(
+                      `[sync] │     ✗ Failed to store found board item ID`,
+                    );
+                  }
+                } else {
+                  logger.info(`[sync] │     └─ Board item not found`);
+                }
+              }
+
+              if (boardItemId) {
+                try {
+                  logger.info(`[sync] │     ├─ Updating board analytics...`);
+                  await updateBoardItem(
+                    mondayToken,
+                    boardItemId,
+                    analytics,
+                    columnMap,
+                    columns,
+                    boardId,
+                  );
+                  logger.info(`[sync] │     └─ Board updated: ✓`);
+                } catch (err) {
+                  logger.error(
+                    `[sync] │     ✗ Board update failed: ${err.message}`,
+                  );
+                }
+              } else {
+                // No board item found — create one now as recovery
+                logger.warn(
+                  `[sync] │  ✗ No board item found for post ${postId}, attempting recovery`,
+                );
+                try {
+                  boardItemId = await createBoardItem(
+                    mondayToken,
+                    updatedPost,
+                    columnMap,
+                    columns,
+                    boardId,
+                  );
+                  const updateRes = await updatePostInStorage(
+                    mondayToken,
+                    postId,
+                    {
+                      ...updatedPost,
+                      boardItemId,
+                    },
+                  );
+                  if (updateRes.success) {
+                    logger.info(
+                      `[sync] │  └─ Board item created successfully (recovery)`,
+                    );
+                  } else {
+                    logger.warn(
+                      `[sync] │  └─ Board item created but storage update failed`,
+                    );
+                  }
+                } catch (err) {
+                  logger.error(
+                    `[sync] │  ✗ Recovery creation failed: ${err.message}`,
+                  );
+                }
+              }
+
+              // ── FIX 2: Original code pushed UPDATED twice (once inside the
+              // boardItemId branch and once after). Removed the duplicate push.
+              results.push({
+                postId,
+                postedAt: details.createdAt,
+                boardItemId: boardItemId || null,
+                status: "UPDATED",
+              });
+            } else {
+              logger.info(`[sync] │  └─ Action: SKIP (no analytics changes)`);
+              results.push({
+                postId,
+                postedAt: details.createdAt,
+                boardItemId: existingPost.boardItemId || null,
+                status: "UNCHANGED",
+              });
+            }
           }
+        } // ← each post fully completes before next starts
 
-          results.push({
-            postId,
-            postedAt: details.createdAt,
-            boardItemId: boardItemId || null,
-            status: "UPDATED",
-          });
-        } else {
-          logger.info(`[sync] │  └─ Action: SKIP (no analytics changes)`);
-          results.push({
-            postId,
-            postedAt: details.createdAt,
-            boardItemId: existingPost.boardItemId || null,
-            status: "UNCHANGED",
-          });
-        }
-      }
-    } // ← each post fully completes before next starts
-
-    // ── Step 8: Compilation ─────────────────────────────────────────
-    logger.info(`[sync] Step 8: Compilation complete`);
-    const summary = {
-      total: results.length,
-      created: results.filter(
-        (r) => r.status === "CREATED" || r.status === "CREATED_STORAGE_ONLY",
-      ).length,
-      updated: results.filter((r) => r.status === "UPDATED").length,
-      unchanged: results.filter((r) => r.status === "UNCHANGED").length,
-      failed: results.filter((r) => r.status.includes("FAILED")).length,
-    };
-
-    logger.info(
-      `[sync] └─ Created: ${summary.created}, Updated: ${summary.updated}, Unchanged: ${summary.unchanged}, Failed: ${summary.failed}`,
-    );
-
-    // ─── Final callback (if provided) ──────────────────────────────────
-    if (callbackUrl) {
-      logger.info(`[sync] Step 9: Send callback to Monday`);
-      try {
-        const authToken = getAuthToken();
-
-        // Correct payload structure for Monday async callback
-        const callbackPayload = {
-          success: true,
-          outputFields: {},
+        // Step 8: Compilation
+        logger.info(`[sync] Step 8: Compilation complete`);
+        const summary = {
+          total: results.length,
+          created: results.filter(
+            (r) =>
+              r.status === "CREATED" || r.status === "CREATED_STORAGE_ONLY",
+          ).length,
+          updated: results.filter((r) => r.status === "UPDATED").length,
+          unchanged: results.filter((r) => r.status === "UNCHANGED").length,
+          failed: results.filter((r) => r.status.includes("FAILED")).length,
         };
 
-        logger.info(`[sync] └─ Sending to: ${callbackUrl}`);
-        await axios.post(callbackUrl, callbackPayload, {
-          timeout: 10000,
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: authToken,
-          },
-        });
-        logger.info(`[sync] └─ Callback sent: ✓`);
-      } catch (callbackErr) {
+        logger.info(
+          `[sync] └─ Created: ${summary.created}, Updated: ${summary.updated}, Unchanged: ${summary.unchanged}, Failed: ${summary.failed}`,
+        );
+
+        logger.info(
+          "═════════════════════════════════════════════════════════════",
+        );
+        logger.info("[sync] ▶ Sync completed successfully");
+        logger.info(
+          "═════════════════════════════════════════════════════════════",
+        );
+
+        // Step 9: Send success callback to Monday
+        await sendCallback(callbackUrl, true);
+      } catch (innerErr) {
         logger.error(
-          `[sync] └─ Callback error (non-fatal): ${callbackErr.message}`,
+          "═════════════════════════════════════════════════════════════",
         );
+        logger.error("[sync] ✗✗✗ ASYNC SYNC JOB FAILED ✗✗✗");
+        logger.error(`[sync] Error: ${innerErr.message}`);
+        logger.error(`[sync] Stack: ${innerErr.stack}`);
+        logger.error(
+          "═════════════════════════════════════════════════════════════",
+        );
+        await sendCallback(callbackUrl, false);
       }
-    } else {
-      logger.warn(`[sync] └─ No callback URL provided by Monday`);
-    }
-
-    logger.info(
-      `[sync] ═════════════════════════════════════════════════════════════`,
-    );
-    logger.info(`[sync] ▶ Sync completed successfully`);
-    logger.info(
-      `[sync] ═════════════════════════════════════════════════════════════`,
-    );
-
-    return res.json({ success: true, summary, results });
+    })(); // fire-and-forget async IIFE
   } catch (err) {
+    // This outer catch only fires if something goes wrong BEFORE res.status(200) is sent
     logger.error(
-      `[sync] ═════════════════════════════════════════════════════════════`,
+      "═════════════════════════════════════════════════════════════",
     );
-    logger.error(`[sync] ✗✗✗ SYNC FAILED ✗✗✗`);
-    logger.error(`[sync] Error message: ${err.message}`);
-    logger.error(`[sync] Error stack: ${err.stack}`);
+    logger.error("[sync] ✗✗✗ OUTER SYNC FAILED (before ACK) ✗✗✗");
+    logger.error(`[sync] Error: ${err.message}`);
+    logger.error(`[sync] Stack: ${err.stack}`);
     logger.error(
-      `[sync] ═════════════════════════════════════════════════════════════`,
+      "═════════════════════════════════════════════════════════════",
     );
 
-    // ─── SEND ERROR CALLBACK TO MONDAY ───────────────────────────────────
-    if (callbackUrl) {
-      try {
-        const authToken = getAuthToken();
-
-        logger.info(`[sync] Sending error callback to: ${callbackUrl}`);
-        await axios.post(
-          callbackUrl,
-          {
-            success: false,
-            outputFields: {},
-          },
-          {
-            timeout: 10000,
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: authToken,
-            },
-          },
-        );
-        logger.info(`[sync] Error callback sent`);
-      } catch (callbackErr) {
-        logger.warn(
-          `[sync] Could not send error callback: ${callbackErr.message}`,
-        );
-      }
-    } else {
-      logger.warn(`[sync] No callback URL provided by Monday`);
+    if (!res.headersSent) {
+      return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+        success: false,
+        error: MESSAGES.INTERNAL_SERVER_ERROR,
+      });
     }
 
-    return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
-      success: false,
-      error: MESSAGES.INTERNAL_SERVER_ERROR,
-    });
+    await sendCallback(callbackUrl, false);
   }
 };
