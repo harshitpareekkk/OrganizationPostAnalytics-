@@ -30,6 +30,7 @@ export const installController = async (req, res) => {
       const linkedInUrl = new URL(
         "https://www.linkedin.com/oauth/v2/authorization",
       );
+      console.log(linkedInUrl);
       for (const [key, value] of Object.entries(req.query)) {
         linkedInUrl.searchParams.set(key, value);
       }
