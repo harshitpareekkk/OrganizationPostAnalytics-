@@ -29,6 +29,7 @@ export const buildLinkedInAuthUrl = (clientId, redirectUri, state) => {
     scope: scopes,
     state,
   });
+  // just for testing we have added a line
   console.log(params);
 
   const url = `${LINKEDIN_AUTH_URL}?${params.toString()}`;
