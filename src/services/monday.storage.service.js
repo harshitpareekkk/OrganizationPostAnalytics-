@@ -2,6 +2,7 @@ import { Storage } from "@mondaycom/apps-sdk";
 import { logger } from "../utils/logger.js";
 import { MESSAGES } from "../constants/messages.constant.js";
 import { StatusCodes } from "../constants/statusCodes.constants.js";
+import { getConfig } from "../constants/env.constants.js";
 
 const SHARED = { shared: true };
 const INDEX_KEY = "linkedin_post_index";
@@ -54,7 +55,7 @@ export const getStoredPost = async (token, postId) => {
     const res = await storage.get(postKey(postId), SHARED);
 
     if (!res || !res.success || res.value === null || res.value === undefined) {
-      logger.info(`[storage] GET post ${postId}: ✗ not found in storage`);
+      logger.info(`[storage] GET post ${postId}: not found in storage`);
       return {
         success: false,
         statusCode: StatusCodes.NOT_FOUND,
@@ -64,7 +65,7 @@ export const getStoredPost = async (token, postId) => {
 
     const post = fromStorage(res.value);
     if (!post) {
-      logger.warn(`[storage] GET post ${postId}: ✗ JSON parse failed`);
+      logger.warn(`[storage] GET post ${postId}: JSON parse failed`);
       return {
         success: false,
         statusCode: StatusCodes.INTERNAL_SERVER_ERROR,
@@ -77,7 +78,7 @@ export const getStoredPost = async (token, postId) => {
     );
     return { success: true, statusCode: StatusCodes.OK, data: post };
   } catch (err) {
-    logger.error(`[storage] GET post ${postId}: ✗ Operation failed`);
+    logger.error(`[storage] GET post ${postId}: Operation failed`);
     logger.error(`[storage] ├─ Error message: ${err.message}`);
     logger.error(`[storage] ├─ Error code: ${err.code || "unknown"}`);
     logger.error(`[storage] ├─ Error status: ${err.status || "unknown"}`);
@@ -132,25 +133,25 @@ export const savePostToStorage = async (token, postObj) => {
         error: MESSAGES.INTERNAL_SERVER_ERROR,
       };
     }
-    logger.info(`[storage] SAVE post ${postId}: ✓ post written to storage`);
+    logger.info(`[storage] SAVE post ${postId}: post written to storage`);
 
     // 2. Update the index
     logger.info(`[storage] SAVE post ${postId}: updating index`);
     const { ids, version } = await readIndex(storage);
     if (!ids.includes(postId)) ids.push(postId);
     await writeIndex(storage, ids, version);
-    logger.info(`[storage] SAVE post ${postId}: ✓ index updated`);
+    logger.info(`[storage] SAVE post ${postId}: index updated`);
 
-    logger.info(`[storage] SAVE post ${postId}: ✓ SUCCESS`);
+    logger.info(`[storage] SAVE post ${postId}: SUCCESS`);
     return { success: true, statusCode: StatusCodes.CREATED };
   } catch (err) {
-    logger.error(`[storage] SAVE post ${postId}: ✗ Operation failed`);
+    logger.error(`[storage] SAVE post ${postId}: Operation failed`);
     logger.error(`[storage] ├─ Error message: ${err.message}`);
     logger.error(`[storage] ├─ Error code: ${err.code || "unknown"}`);
     logger.error(`[storage] └─ Stack: ${err.stack}`);
 
     if (err.message?.includes("401") || err.status === 401) {
-      logger.error(`[storage] ✗ AUTHORIZATION ERROR: Token invalid or expired`);
+      logger.error(`[storage] AUTHORIZATION ERROR: Token invalid or expired`);
       return {
         success: false,
         statusCode: StatusCodes.UNAUTHORIZED,
@@ -206,10 +207,10 @@ export const updatePostInStorage = async (token, postId, updatedPostObj) => {
       await storage.set(postKey(postId), toStorage(updatedPostObj), SHARED);
     }
 
-    logger.info(`[storage] UPDATE post ${postId}: ✓ SUCCESS`);
+    logger.info(`[storage] UPDATE post ${postId}: SUCCESS`);
     return { success: true, statusCode: StatusCodes.OK };
   } catch (err) {
-    logger.error(`[storage] UPDATE post ${postId}: ✗ Operation failed`);
+    logger.error(`[storage] UPDATE post ${postId}: Operation failed`);
     logger.error(`[storage] ├─ Error message: ${err.message}`);
     logger.error(`[storage] ├─ Error code: ${err.code || "unknown"}`);
     logger.error(`[storage] └─ Stack: ${err.stack}`);
@@ -336,7 +337,8 @@ const getToken = (req) => {
     return req.session.token;
   }
   // Fallback to .env
-  return process.env.MONDAY_API_KEY;
+  const config = getConfig();
+  return config.MONDAY_API_KEY;
 };
 
 // Helper to format post for response

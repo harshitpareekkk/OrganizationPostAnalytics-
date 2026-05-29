@@ -1,8 +1,12 @@
 import axios from "axios";
 import { logger } from "../utils/logger.js";
+import { getConfig } from "../constants/env.constants.js";
+import { API_ENDPOINTS, QUERY_PARAMS } from "../constants/api.constants.js";
+import { getLinkedInUGCHeaders } from "../constants/headers.constants.js";
+import { TIME_CONSTANTS, POST_TYPES } from "../constants/app.constants.js";
 
-const BASE = "https://api.linkedin.com/v2";
-const PAGE_SIZE = 50;
+const BASE = API_ENDPOINTS.LINKEDIN.BASE_V2;
+const PAGE_SIZE = QUERY_PARAMS.PAGINATION.LINKEDIN_PAGE_SIZE;
 const authorCache = {};
 
 const fetchAuthorName = async (token, authorUrn) => {
@@ -12,7 +16,7 @@ const fetchAuthorName = async (token, authorUrn) => {
   try {
     const memberId = authorUrn.split(":").pop(); // "abc123"
     const res = await axios.get(`${BASE}/people/(id:${memberId})`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: getLinkedInUGCHeaders(token),
       params: { projection: "(id,firstName,lastName)" },
     });
 
@@ -46,7 +50,7 @@ export const extractPostDetails = (post, resolvedAuthorName = "") => {
     postId,
     // FULL text — not .slice(), not truncated in any way
     text: post?.text?.text || "",
-    postType: post?.content?.shareMediaCategory || "TEXT",
+    postType: post?.content?.shareMediaCategory || POST_TYPES.TEXT,
     // Real post URL for clicking through from Monday board
     postUrl: `https://www.linkedin.com/feed/update/urn:li:share:${postId}`,
     owner: post.owner || "",
@@ -61,10 +65,27 @@ export const extractPostDetails = (post, resolvedAuthorName = "") => {
 // ─── Fetch last 3 months posts ────────────────────────────────────────────────
 
 export const fetchLastThreeMonthsPosts = async () => {
-  const token = process.env.LINKEDIN_ACCESS_TOKEN;
-  const orgId = process.env.LINKEDIN_ORG_ID;
+  const config = getConfig();
+  const token = config.LINKEDIN_ACCESS_TOKEN;
+  const orgId = config.LINKEDIN_ORG_ID;
 
-  const cutoffMs = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  if (!token || token.trim().length === 0) {
+    const err = new Error(
+      "LINKEDIN_ACCESS_TOKEN is not configured in .env",
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!orgId || orgId.trim().length === 0) {
+    const err = new Error(
+      "LINKEDIN_ORG_ID is not configured in .env",
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const cutoffMs = Date.now() - TIME_CONSTANTS.CUTOFF_TIME_MS;
   logger.info(`[linkedin] Fetching posts from last 90 days`);
 
   const collected = [];
@@ -81,13 +102,37 @@ export const fetchLastThreeMonthsPosts = async () => {
     let res;
     try {
       res = await axios.get(url, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: getLinkedInUGCHeaders(token),
       });
     } catch (err) {
+      const statusCode = err.response?.status;
+      const errorMsg = err.response?.data?.message || err.message;
+
+      if (statusCode === 401 || statusCode === 403) {
+        logger.error(
+          `[linkedin] ✗ AUTHENTICATION FAILED (${statusCode}): ${errorMsg}`,
+        );
+        logger.error(
+          `[linkedin] └─ The LINKEDIN_ACCESS_TOKEN in .env is likely expired or invalid`,
+        );
+        logger.error(
+          `[linkedin] └─ Solution: Refresh the token from LinkedIn app settings`,
+        );
+        const err401 = new Error(
+          `LinkedIn API returned ${statusCode}: ${errorMsg}. Token may be expired.`,
+        );
+        err401.statusCode = statusCode;
+        throw err401;
+      }
+
       logger.error(
-        `[linkedin] Failed to fetch page ${pageCount}: ${err.message}`,
+        `[linkedin] Failed to fetch page ${pageCount}: [${statusCode}] ${errorMsg}`,
       );
-      break;
+      const fetchErr = new Error(
+        `Failed to fetch LinkedIn posts: ${errorMsg}`,
+      );
+      fetchErr.statusCode = statusCode || 500;
+      throw fetchErr;
     }
 
     const elements = res.data?.elements || [];
@@ -153,8 +198,9 @@ export const fetchLastThreeMonthsPosts = async () => {
 
 // Fetch post analytics
 export const fetchPostStats = async (postId) => {
-  const token = process.env.LINKEDIN_ACCESS_TOKEN;
-  const orgId = process.env.LINKEDIN_ORG_ID;
+  const config = getConfig();
+  const token = config.LINKEDIN_ACCESS_TOKEN;
+  const orgId = config.LINKEDIN_ORG_ID;
 
   const url =
     `${BASE}/organizationalEntityShareStatistics?q=organizationalEntity` +
@@ -162,7 +208,7 @@ export const fetchPostStats = async (postId) => {
 
   try {
     const res = await axios.get(url, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: getLinkedInUGCHeaders(token),
     });
     const stats = res.data.elements?.[0]?.totalShareStatistics || {};
 

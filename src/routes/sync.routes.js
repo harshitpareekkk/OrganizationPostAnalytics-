@@ -10,19 +10,19 @@ import {
 
 const router = express.Router();
 
-// ── POST /api/sync
+// POST /api/sync
 router.post("/sync", authorizeRequest, syncLinkedInPosts);
 
-// ── GET /api/storage --> get all stored posts for this account
+// get all stored posts for this account
 router.get("/storage", authorizeRequest, getAllStoredPostsHandler);
 
-// ── GET /api/storage/:postId ---> getting a particular stored post by its postId (LinkedIn post URN)
+//  getting a particular stored post by its postId (LinkedIn post URN)
 router.get("/storage/:postId", authorizeRequest, getStoredPostHandler);
 
-// ── DELETE /api/storage --> delete all stored posts for this account
+//  delete all stored posts for this account
 router.delete("/storage", authorizeRequest, deleteAllStoredPostsHandler);
 
-// ── DELETE /api/storage/:postId ---> deleting a particular post from storage
+//  deleting a particular post from storage
 router.delete("/storage/:postId", authorizeRequest, deleteStoredPostHandler);
-
+        
 export default router;

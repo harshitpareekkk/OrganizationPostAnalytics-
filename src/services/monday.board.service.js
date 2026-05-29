@@ -1,16 +1,21 @@
 import axios from "axios";
 import { logger } from "../utils/logger.js";
+import { API_ENDPOINTS, QUERY_PARAMS } from "../constants/api.constants.js";
+import { getMondayHeaders } from "../constants/headers.constants.js";
+import {
+  MONDAY_POST_TYPE_INDEX,
+  REQUEST_TIMEOUTS,
+} from "../constants/app.constants.js";
 
 // ─── Use axios directly against Monday's REST/GraphQL endpoint ────────────────
 // The monday-sdk-js sets token globally which causes race conditions when
 // multiple requests run concurrently. axios + per-request headers is safer.
-const MONDAY_API_URL = "https://api.monday.com/v2";
-const MONDAY_API_VERSION = "2024-10"; // Updated from stale 2023-10
+const MONDAY_API_URL = API_ENDPOINTS.MONDAY.BASE;
 
 // ─── GraphQL helper ───────────────────────────────────────────────────────────
 const gql = async (token, query, variables = {}) => {
   if (!token || typeof token !== "string" || token.length === 0) {
-    logger.error(`[gql] ✗ Invalid token — empty or not a string`);
+    logger.error(`[gql] Invalid token - empty or not a string`);
     throw new Error("Invalid token: must be a non-empty string");
   }
 
@@ -21,12 +26,8 @@ const gql = async (token, query, variables = {}) => {
       MONDAY_API_URL,
       { query, variables },
       {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: token, // Monday accepts raw token (no "Bearer" prefix)
-          "API-Version": MONDAY_API_VERSION,
-        },
-        timeout: 30000,
+        headers: getMondayHeaders(token),
+        timeout: REQUEST_TIMEOUTS.EXTENDED,
       },
     );
 
@@ -38,7 +39,7 @@ const gql = async (token, query, variables = {}) => {
       throw new Error(`Monday API error: ${msgs}`);
     }
 
-    logger.info(`[gql] ✓ Query executed successfully`);
+    logger.info(`[gql] Query executed successfully`);
     return body.data;
   } catch (err) {
     // Enrich axios HTTP errors with status code for better debugging
@@ -88,27 +89,17 @@ export const testMondayAccess = async (token, boardId) => {
     );
     return board;
   } catch (err) {
-    logger.error(`[testMondayAccess] ✗ FAILED: ${err.message}`);
+    logger.error(`[testMondayAccess] FAILED: ${err.message}`);
     throw err;
   }
 };
 
-// ─── Post type → Monday status index ─────────────────────────────────────────
-const POST_TYPE_INDEX = {
-  IMAGE: 0,
-  DOCUMENT: 1,
-  VIDEO: 2,
-  TEXT: 3,
-  RICH: 4,
-  ARTICLE: 6,
-};
-
 const toStatusValue = (postType) => {
-  const index = POST_TYPE_INDEX[(postType || "").toUpperCase()];
+  const index = MONDAY_POST_TYPE_INDEX[(postType || "").toUpperCase()];
   return index !== undefined ? { index } : null;
 };
 
-// ─── Format a value for its column type ──────────────────────────────────────
+// ─── Format a value for its column type
 const formatValue = (value, colType) => {
   if (value === null || value === undefined || value === "") return null;
 
@@ -191,7 +182,7 @@ export const fetchBoardColumns = async (token, boardId) => {
 
     return { columns, columnMap };
   } catch (err) {
-    logger.error(`[fetchBoardColumns] ✗ Failed: ${err.message}`);
+    logger.error(`[fetchBoardColumns] Failed: ${err.message}`);
     throw err;
   }
 };
@@ -387,10 +378,10 @@ export const createBoardItem = async (
       throw new Error("create_item returned no id — check board permissions");
     }
 
-    logger.info(`[createBoardItem] ✓ Created item: ${itemId}`);
+    logger.info(`[createBoardItem] Created item: ${itemId}`);
     return String(itemId);
   } catch (err) {
-    logger.error(`[createBoardItem] ✗ Failed: ${err.message}`);
+    logger.error(`[createBoardItem] Failed: ${err.message}`);
     throw err;
   }
 };
@@ -446,10 +437,10 @@ export const updateBoardItem = async (
       throw new Error("change_multiple_column_values returned no id");
     }
 
-    logger.info(`[updateBoardItem] ✓ Updated item: ${safeItemId}`);
+    logger.info(`[updateBoardItem] Updated item: ${safeItemId}`);
     return updatedId;
   } catch (err) {
-    logger.error(`[updateBoardItem] ✗ Failed: ${err.message}`);
+    logger.error(`[updateBoardItem] Failed: ${err.message}`);
     throw err;
   }
 };
